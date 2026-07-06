@@ -8,9 +8,10 @@ import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pcbnew
+from commands.routing_quality import evaluate_route_quality, loaded_rule_ids, rule_catalog
 
 logger = logging.getLogger("kicad_interface")
 
@@ -143,6 +144,588 @@ class RoutingCommands:
     def __init__(self, board: Optional[pcbnew.BOARD] = None):
         """Initialize with optional board instance"""
         self.board = board
+
+    def evaluate_routing_quality(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Score one or more routes from explicit rule pass/fail outcomes."""
+        try:
+            routes = params.get("routes")
+            if isinstance(routes, list) and routes:
+                evaluated = []
+                inherited = {key: value for key, value in params.items() if key != "routes"}
+                for route in routes:
+                    if not isinstance(route, dict):
+                        continue
+                    merged = {**inherited, **route}
+                    auto = self._auto_detect_routing_quality(merged)
+                    merged = self._merge_auto_detected_rules(merged, auto)
+                    evaluated.append(evaluate_route_quality(merged))
+                    evaluated[-1]["autoDetection"] = auto
+
+                return {
+                    "success": True,
+                    "message": "Evaluated routing quality",
+                    "scoreType": "penalty",
+                    "scoreMeaning": "Higher score means more loaded routing-quality rules were not satisfied.",
+                    "routeCount": len(evaluated),
+                    "routes": evaluated,
+                    "totalScore": sum(route["score"] for route in evaluated),
+                    "maxTotalScore": sum(route["maxScore"] for route in evaluated),
+                    **({"ruleCatalog": rule_catalog()} if params.get("includeRuleCatalog") else {}),
+                }
+
+            auto = self._auto_detect_routing_quality(params)
+            evaluated = evaluate_route_quality(self._merge_auto_detected_rules(params, auto))
+            return {
+                "success": True,
+                "message": "Evaluated routing quality",
+                "scoreType": "penalty",
+                "scoreMeaning": "Higher score means more loaded routing-quality rules were not satisfied.",
+                **evaluated,
+                "autoDetection": auto,
+                **({"ruleCatalog": rule_catalog()} if params.get("includeRuleCatalog") else {}),
+            }
+        except Exception as e:
+            logger.error(f"Error evaluating routing quality: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to evaluate routing quality",
+                "errorDetails": str(e),
+            }
+
+    def _merge_auto_detected_rules(
+        self, params: Dict[str, Any], auto: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Merge automatic rule outcomes into a scoring request without losing manual input."""
+        merged = dict(params)
+        failed = list(params.get("failedRules") or params.get("violations") or [])
+        passed = list(params.get("passedRules") or [])
+
+        for rule_id in auto.get("failedRules", []):
+            if rule_id not in failed:
+                failed.append(rule_id)
+        for rule_id in auto.get("passedRules", []):
+            if rule_id not in passed and rule_id not in failed:
+                passed.append(rule_id)
+
+        merged["failedRules"] = failed
+        merged["passedRules"] = passed
+        return merged
+
+    def _auto_detect_routing_quality(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run geometry-based checks for the routing-quality rules implemented so far."""
+        detection = {
+            "enabled": bool(params.get("autoDetect", True)),
+            "implementedRules": [
+                "board_edge_high_speed_emi",
+                "via_transition_has_return_path",
+                "excessive_detour_for_critical_net",
+                "differential_pair_together",
+                "crystal_short_no_via",
+                "esd_close_to_connector",
+            ],
+            "failedRules": [],
+            "passedRules": [],
+            "details": {},
+        }
+
+        if not detection["enabled"]:
+            detection["details"]["autoDetect"] = {"status": "skipped", "reason": "disabled"}
+            return detection
+        if not self.board:
+            detection["details"]["board"] = {"status": "skipped", "reason": "no board loaded"}
+            return detection
+
+        loaded = set(loaded_rule_ids(params))
+        target = self._collect_target_route_items(params)
+        if not target["segments"] and not target["vias"]:
+            detection["details"]["targetRoute"] = {
+                "status": "skipped",
+                "reason": "no matching trace/via found; provide traceUuid or net",
+            }
+            return detection
+
+        checks = {
+            "board_edge_high_speed_emi": self._check_board_edge_high_speed_emi,
+            "via_transition_has_return_path": self._check_via_transition_has_return_path,
+            "excessive_detour_for_critical_net": self._check_excessive_detour_for_critical_net,
+            "differential_pair_together": self._check_differential_pair_together,
+            "crystal_short_no_via": self._check_crystal_short_no_via,
+            "esd_close_to_connector": self._check_esd_close_to_connector,
+        }
+
+        for rule_id, check in checks.items():
+            if rule_id not in loaded:
+                continue
+            try:
+                result = check(params, target)
+            except Exception as exc:
+                logger.warning(f"Routing quality auto-check {rule_id} failed: {exc}")
+                result = {"status": "skipped", "reason": str(exc)}
+
+            detection["details"][rule_id] = result
+            if result.get("status") == "failed":
+                detection["failedRules"].append(rule_id)
+            elif result.get("status") == "passed":
+                detection["passedRules"].append(rule_id)
+
+        return detection
+
+    def _collect_target_route_items(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        trace_uuid = params.get("traceUuid") or params.get("uuid")
+        net_name = params.get("net")
+        segments = []
+        vias = []
+        nets = set()
+
+        for item in list(self.board.Tracks()):
+            if trace_uuid and self._item_uuid(item) != trace_uuid:
+                continue
+            if net_name and self._item_net(item) != net_name:
+                continue
+            if not trace_uuid and not net_name:
+                continue
+
+            item_net = self._item_net(item)
+            if item_net:
+                nets.add(item_net)
+            if self._is_via(item):
+                vias.append(item)
+            else:
+                segments.append(item)
+
+        if not net_name and len(nets) == 1:
+            net_name = next(iter(nets))
+
+        return {
+            "traceUuid": trace_uuid,
+            "net": net_name,
+            "segments": segments,
+            "vias": vias,
+            "nets": sorted(nets),
+        }
+
+    def _item_uuid(self, item: Any) -> Optional[str]:
+        try:
+            return item.m_Uuid.AsString()
+        except Exception:
+            pass
+        try:
+            return item.GetUuid().AsString()
+        except Exception:
+            return None
+
+    def _item_net(self, item: Any) -> str:
+        try:
+            return item.GetNetname() or ""
+        except Exception:
+            return ""
+
+    def _is_via(self, item: Any) -> bool:
+        try:
+            if item.Type() == pcbnew.PCB_VIA_T:
+                return True
+        except Exception:
+            pass
+        try:
+            return item.GetClass() == "PCB_VIA"
+        except Exception:
+            return False
+
+    def _point_xy(self, point: Any) -> Tuple[int, int]:
+        return int(point.x), int(point.y)
+
+    def _track_points(self, track: Any) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        start = track.GetStart()
+        end = track.GetEnd()
+        return self._point_xy(start), self._point_xy(end)
+
+    def _via_point(self, via: Any) -> Tuple[int, int]:
+        return self._point_xy(via.GetPosition())
+
+    def _track_length_nm(self, track: Any) -> float:
+        try:
+            return float(track.GetLength())
+        except Exception:
+            (x1, y1), (x2, y2) = self._track_points(track)
+            return math.hypot(x2 - x1, y2 - y1)
+
+    def _route_length_mm(self, target: Dict[str, Any]) -> float:
+        total_nm = sum(self._track_length_nm(track) for track in target["segments"])
+        return total_nm / 1000000
+
+    def _net_matches_any(self, net: Optional[str], names: Iterable[Any]) -> bool:
+        if not net:
+            return False
+        net_upper = net.upper()
+        return any(str(name).upper() == net_upper for name in names or [])
+
+    def _is_high_speed_or_critical_net(self, net: Optional[str], params: Dict[str, Any]) -> bool:
+        if self._net_matches_any(net, params.get("highSpeedNets", [])):
+            return True
+        if self._net_matches_any(net, params.get("criticalNets", [])):
+            return True
+        if not net:
+            return False
+
+        name = net.upper().replace("/", "_").replace("-", "_")
+        tokens = (
+            "USB",
+            "D+",
+            "D-",
+            "DP",
+            "DM",
+            "CLK",
+            "CLOCK",
+            "XTAL",
+            "XIN",
+            "XOUT",
+            "OSC",
+            "MIPI",
+            "LVDS",
+            "HDMI",
+            "PCIE",
+            "ETH",
+            "RGMII",
+            "RMII",
+            "SPI",
+            "QSPI",
+            "SDIO",
+            "CAN",
+            "CRIT",
+        )
+        return any(token in name for token in tokens)
+
+    def _is_ground_net(self, net: Optional[str], params: Dict[str, Any]) -> bool:
+        ground_nets = params.get("groundNets") or ["GND", "GROUND", "VSS", "AGND", "DGND", "/GND"]
+        return self._net_matches_any(net, ground_nets)
+
+    def _check_board_edge_high_speed_emi(
+        self, params: Dict[str, Any], target: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        net = target.get("net") or params.get("net")
+        if not self._is_high_speed_or_critical_net(net, params):
+            return {"status": "not_applicable", "reason": "net is not marked or inferred high-speed"}
+
+        clearance_mm = float(params.get("boardEdgeClearanceMm", 3.0))
+        try:
+            box = self.board.GetBoardEdgesBoundingBox()
+            left = int(box.GetX())
+            top = int(box.GetY())
+            right = left + int(box.GetWidth())
+            bottom = top + int(box.GetHeight())
+        except Exception:
+            return {"status": "skipped", "reason": "board outline bounding box unavailable"}
+
+        min_distance_nm = float("inf")
+        for track in target["segments"]:
+            (x1, y1), (x2, y2) = self._track_points(track)
+            distance = min(min(x1, x2) - left, right - max(x1, x2), min(y1, y2) - top, bottom - max(y1, y2))
+            min_distance_nm = min(min_distance_nm, distance)
+        for via in target["vias"]:
+            x, y = self._via_point(via)
+            min_distance_nm = min(min_distance_nm, x - left, right - x, y - top, bottom - y)
+
+        if min_distance_nm == float("inf"):
+            return {"status": "skipped", "reason": "target route has no geometry"}
+
+        min_distance_mm = min_distance_nm / 1000000
+        status = "failed" if min_distance_mm < clearance_mm else "passed"
+        return {
+            "status": status,
+            "net": net,
+            "minDistanceMm": round(min_distance_mm, 4),
+            "requiredClearanceMm": clearance_mm,
+        }
+
+    def _check_via_transition_has_return_path(
+        self, params: Dict[str, Any], target: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        signal_vias = [via for via in target["vias"] if not self._is_ground_net(self._item_net(via), params)]
+        if not signal_vias:
+            return {"status": "not_applicable", "reason": "target route has no signal vias"}
+
+        radius_mm = float(params.get("returnViaRadiusMm", 2.0))
+        radius_nm = radius_mm * 1000000
+        ground_vias = [
+            via
+            for via in list(self.board.Tracks())
+            if self._is_via(via) and self._is_ground_net(self._item_net(via), params)
+        ]
+
+        missing = []
+        for via in signal_vias:
+            vx, vy = self._via_point(via)
+            nearest_nm = float("inf")
+            for gnd_via in ground_vias:
+                gx, gy = self._via_point(gnd_via)
+                nearest_nm = min(nearest_nm, math.hypot(vx - gx, vy - gy))
+            if nearest_nm > radius_nm:
+                missing.append(
+                    {
+                        "position": {"x": vx / 1000000, "y": vy / 1000000, "unit": "mm"},
+                        "nearestGroundViaMm": None
+                        if nearest_nm == float("inf")
+                        else round(nearest_nm / 1000000, 4),
+                    }
+                )
+
+        return {
+            "status": "failed" if missing else "passed",
+            "signalViaCount": len(signal_vias),
+            "groundViaCount": len(ground_vias),
+            "requiredRadiusMm": radius_mm,
+            "missingReturnPathVias": missing,
+        }
+
+    def _check_excessive_detour_for_critical_net(
+        self, params: Dict[str, Any], target: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        net = target.get("net") or params.get("net")
+        if not self._is_high_speed_or_critical_net(net, params):
+            return {"status": "not_applicable", "reason": "net is not marked or inferred critical"}
+
+        points: List[Tuple[int, int]] = []
+        for track in target["segments"]:
+            start, end = self._track_points(track)
+            points.extend([start, end])
+        for via in target["vias"]:
+            points.append(self._via_point(via))
+        if len(points) < 2:
+            return {"status": "skipped", "reason": "not enough route geometry"}
+
+        route_length_mm = self._route_length_mm(target)
+        straight_nm = 0.0
+        for i, (x1, y1) in enumerate(points):
+            for x2, y2 in points[i + 1 :]:
+                straight_nm = max(straight_nm, math.hypot(x2 - x1, y2 - y1))
+        straight_mm = straight_nm / 1000000
+        if straight_mm <= 0:
+            return {"status": "skipped", "reason": "zero straight-line span"}
+
+        ratio = route_length_mm / straight_mm
+        max_ratio = float(params.get("maxDetourRatio", 1.5))
+        max_extra_mm = float(params.get("maxDetourExtraMm", 5.0))
+        extra_mm = route_length_mm - straight_mm
+        failed = ratio > max_ratio and extra_mm > max_extra_mm
+        return {
+            "status": "failed" if failed else "passed",
+            "net": net,
+            "routeLengthMm": round(route_length_mm, 4),
+            "straightLineMm": round(straight_mm, 4),
+            "detourRatio": round(ratio, 4),
+            "maxDetourRatio": max_ratio,
+            "extraLengthMm": round(extra_mm, 4),
+            "maxDetourExtraMm": max_extra_mm,
+        }
+
+    def _check_differential_pair_together(
+        self, params: Dict[str, Any], target: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        net = target.get("net") or params.get("net")
+        mate = self._infer_diff_pair_mate(net, params)
+        if not net or not mate:
+            return {"status": "not_applicable", "reason": "no differential-pair mate inferred"}
+
+        max_gap_mm = float(params.get("maxDiffPairSeparationMm", 0.5))
+        max_gap_nm = max_gap_mm * 1000000
+        mate_segments = [
+            item
+            for item in list(self.board.Tracks())
+            if not self._is_via(item) and self._item_net(item) == mate
+        ]
+        if not mate_segments:
+            return {"status": "failed", "net": net, "mateNet": mate, "reason": "mate net has no traces"}
+
+        unpaired = []
+        for track in target["segments"]:
+            start, end = self._track_points(track)
+            mid_x = (start[0] + end[0]) // 2
+            mid_y = (start[1] + end[1]) // 2
+            layer = self._track_layer(track)
+            nearest_nm = float("inf")
+            nearest_same_layer_nm = float("inf")
+            for mate_track in mate_segments:
+                m_start, m_end = self._track_points(mate_track)
+                dist = _point_to_segment_distance_nm(
+                    mid_x, mid_y, m_start[0], m_start[1], m_end[0], m_end[1]
+                )
+                nearest_nm = min(nearest_nm, dist)
+                if self._track_layer(mate_track) == layer:
+                    nearest_same_layer_nm = min(nearest_same_layer_nm, dist)
+            if nearest_same_layer_nm > max_gap_nm:
+                unpaired.append(
+                    {
+                        "trackUuid": self._item_uuid(track),
+                        "nearestMateMm": None
+                        if nearest_same_layer_nm == float("inf")
+                        else round(nearest_same_layer_nm / 1000000, 4),
+                        "nearestMateAnyLayerMm": round(nearest_nm / 1000000, 4),
+                    }
+                )
+
+        return {
+            "status": "failed" if unpaired else "passed",
+            "net": net,
+            "mateNet": mate,
+            "maxSeparationMm": max_gap_mm,
+            "checkedSegments": len(target["segments"]),
+            "unpairedSegments": unpaired,
+        }
+
+    def _infer_diff_pair_mate(self, net: Optional[str], params: Dict[str, Any]) -> Optional[str]:
+        explicit = params.get("differentialPairs") or {}
+        if isinstance(explicit, dict) and net in explicit:
+            return explicit[net]
+        if not net:
+            return None
+
+        candidates = []
+        if net.endswith("+"):
+            candidates.append(net[:-1] + "-")
+        if net.endswith("-"):
+            candidates.append(net[:-1] + "+")
+        for suffix_a, suffix_b in (
+            ("_P", "_N"),
+            ("_N", "_P"),
+            ("+","-"),
+            ("-","+"),
+            ("P", "N"),
+            ("N", "P"),
+            ("DP", "DM"),
+            ("DM", "DP"),
+            ("D_P", "D_N"),
+            ("D_N", "D_P"),
+        ):
+            if net.upper().endswith(suffix_a):
+                candidates.append(net[: -len(suffix_a)] + suffix_b)
+
+        existing = {self._item_net(item) for item in list(self.board.Tracks())}
+        for candidate in candidates:
+            if candidate in existing:
+                return candidate
+            for existing_net in existing:
+                if existing_net.upper() == candidate.upper():
+                    return existing_net
+        return None
+
+    def _check_crystal_short_no_via(
+        self, params: Dict[str, Any], target: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        net = target.get("net") or params.get("net")
+        if not self._is_crystal_net(net, params):
+            return {"status": "not_applicable", "reason": "net is not marked or inferred crystal"}
+
+        max_length_mm = float(params.get("maxCrystalTraceLengthMm", 10.0))
+        route_length_mm = self._route_length_mm(target)
+        via_count = len(target["vias"])
+        failed = via_count > 0 or route_length_mm > max_length_mm
+        return {
+            "status": "failed" if failed else "passed",
+            "net": net,
+            "routeLengthMm": round(route_length_mm, 4),
+            "maxLengthMm": max_length_mm,
+            "viaCount": via_count,
+        }
+
+    def _is_crystal_net(self, net: Optional[str], params: Dict[str, Any]) -> bool:
+        if self._net_matches_any(net, params.get("crystalNets", [])):
+            return True
+        if not net:
+            return False
+        name = net.upper()
+        return any(token in name for token in ("XTAL", "XIN", "XOUT", "OSC", "CRYSTAL"))
+
+    def _check_esd_close_to_connector(
+        self, params: Dict[str, Any], target: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        net = target.get("net") or params.get("net")
+        if not net:
+            return {"status": "skipped", "reason": "target net unknown"}
+
+        max_distance_mm = float(params.get("maxEsdConnectorDistanceMm", 5.0))
+        max_distance_nm = max_distance_mm * 1000000
+        connector_pads = []
+        esd_pads = []
+
+        for fp in list(self.board.GetFootprints()):
+            ref = self._footprint_ref(fp)
+            role = self._footprint_role(fp, params)
+            if role not in {"connector", "esd"}:
+                continue
+            for pad in list(fp.Pads()):
+                try:
+                    if pad.GetNetname() != net:
+                        continue
+                    pos = self._point_xy(pad.GetPosition())
+                except Exception:
+                    continue
+                if role == "connector":
+                    connector_pads.append({"ref": ref, "pos": pos})
+                else:
+                    esd_pads.append({"ref": ref, "pos": pos})
+
+        if not connector_pads:
+            return {"status": "not_applicable", "reason": "no connector pad found on target net"}
+        if not esd_pads:
+            return {"status": "failed", "reason": "no ESD/TVS pad found on target net"}
+
+        nearest = None
+        nearest_nm = float("inf")
+        for connector in connector_pads:
+            cx, cy = connector["pos"]
+            for esd in esd_pads:
+                ex, ey = esd["pos"]
+                dist = math.hypot(cx - ex, cy - ey)
+                if dist < nearest_nm:
+                    nearest_nm = dist
+                    nearest = {"connector": connector["ref"], "esd": esd["ref"]}
+
+        return {
+            "status": "failed" if nearest_nm > max_distance_nm else "passed",
+            "net": net,
+            "nearestDistanceMm": round(nearest_nm / 1000000, 4),
+            "maxDistanceMm": max_distance_mm,
+            "nearestPair": nearest,
+        }
+
+    def _track_layer(self, track: Any) -> Optional[int]:
+        try:
+            return int(track.GetLayer())
+        except Exception:
+            return None
+
+    def _footprint_ref(self, fp: Any) -> str:
+        try:
+            return fp.GetReference() or ""
+        except Exception:
+            return ""
+
+    def _footprint_text(self, fp: Any) -> str:
+        values = []
+        for method_name in ("GetReference", "GetValue", "GetFPIDAsString"):
+            try:
+                value = getattr(fp, method_name)()
+                values.append(str(value))
+            except Exception:
+                continue
+        return " ".join(values).upper()
+
+    def _footprint_role(self, fp: Any, params: Dict[str, Any]) -> Optional[str]:
+        ref = self._footprint_ref(fp).upper()
+        text = self._footprint_text(fp)
+        connector_refs = {str(value).upper() for value in params.get("connectorRefs", [])}
+        esd_refs = {str(value).upper() for value in params.get("esdRefs", [])}
+        if ref in connector_refs:
+            return "connector"
+        if ref in esd_refs:
+            return "esd"
+        if ref.startswith(("D", "TVS", "ESD")) or any(
+            token in text for token in ("ESD", "TVS", "PESD", "TPD", "USBLC")
+        ):
+            return "esd"
+        if ref.startswith(("J", "P", "CN", "USB")) or "CONNECTOR" in text or "USB" in text:
+            return "connector"
+        return None
 
     def add_net(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a new net to the PCB"""

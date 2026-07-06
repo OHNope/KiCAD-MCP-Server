@@ -483,6 +483,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "delete_trace": self.routing_commands.delete_trace,
             "query_traces": self.routing_commands.query_traces,
             "query_zones": self.routing_commands.query_zones,
+            "evaluate_routing_quality": self.routing_commands.evaluate_routing_quality,
             "add_gnd_stitching_vias": self.routing_commands.add_gnd_stitching_vias,
             "modify_trace": self.routing_commands.modify_trace,
             "copy_routing_pattern": self.routing_commands.copy_routing_pattern,

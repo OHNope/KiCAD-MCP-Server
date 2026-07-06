@@ -5,6 +5,73 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+const routingQualityRuleId = z.enum([
+  "return_path_crossing_split",
+  "reference_plane_continuity",
+  "gnd_plane_not_fragmented",
+  "via_transition_has_return_path",
+  "aggressor_victim_parallel_coupling",
+  "board_edge_high_speed_emi",
+  "excessive_detour_for_critical_net",
+  "plane_cut_by_signal",
+  "decoupling_loop",
+  "regulator_hot_loop",
+  "sw_node_noise",
+  "crystal_short_no_via",
+  "differential_pair_together",
+  "usb_diff_quality",
+  "can_pair_stub_termination",
+  "analog_away_from_noise",
+  "reset_boot_away_from_noise",
+  "esd_close_to_connector",
+  "high_current_loop",
+  "feedback_trace_quiet",
+]);
+
+const dynamicRoutingQualityRuleId = z.enum([
+  "decoupling_loop",
+  "regulator_hot_loop",
+  "sw_node_noise",
+  "crystal_short_no_via",
+  "differential_pair_together",
+  "usb_diff_quality",
+  "can_pair_stub_termination",
+  "analog_away_from_noise",
+  "reset_boot_away_from_noise",
+  "esd_close_to_connector",
+  "high_current_loop",
+  "feedback_trace_quiet",
+]);
+
+const routingQualityRouteInput = z.object({
+  traceUuid: z.string().optional().describe("Trace UUID being evaluated"),
+  net: z.string().optional().describe("Net name being evaluated"),
+  dynamicRules: z
+    .array(dynamicRoutingQualityRuleId)
+    .optional()
+    .describe("Dynamic rules to load for this route. Always-loaded rules are included automatically."),
+  loadAllDynamicRules: z
+    .boolean()
+    .optional()
+    .describe("Load every dynamic rule for this route instead of listing dynamicRules."),
+  failedRules: z
+    .array(routingQualityRuleId)
+    .optional()
+    .describe("Rules that the route did not satisfy; their scores are added as penalties."),
+  passedRules: z
+    .array(routingQualityRuleId)
+    .optional()
+    .describe("Rules that the route satisfied."),
+  ruleResults: z
+    .record(routingQualityRuleId, z.boolean())
+    .optional()
+    .describe("Rule pass/fail map. false means the rule was not satisfied and adds its score."),
+  autoDetect: z
+    .boolean()
+    .optional()
+    .describe("Automatically inspect board geometry for implemented rules (default true)."),
+});
+
 export function registerRoutingTools(server: McpServer, callKicadScript: Function) {
   // Add net tool
   server.tool(
@@ -248,6 +315,115 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
     },
     async (args: any) => {
       const result = await callKicadScript("query_zones", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Evaluate routing quality tool
+  server.tool(
+    "evaluate_routing_quality",
+    "Evaluate routing quality as a penalty score. The eight core rules are always loaded; dynamic rules are loaded only when listed in dynamicRules or when loadAllDynamicRules is true. For each loaded rule that the route did not satisfy, its configured score is added to the route score. A perfect route scores 0.",
+    {
+      traceUuid: z.string().optional().describe("Trace UUID being evaluated"),
+      net: z.string().optional().describe("Net name being evaluated"),
+      dynamicRules: z
+        .array(dynamicRoutingQualityRuleId)
+        .optional()
+        .describe("Dynamic rules to load. Always-loaded rules are included automatically."),
+      loadAllDynamicRules: z
+        .boolean()
+        .optional()
+        .describe("Load every dynamic rule instead of listing dynamicRules."),
+      failedRules: z
+        .array(routingQualityRuleId)
+        .optional()
+        .describe("Rules that the route did not satisfy; their scores are added as penalties."),
+      passedRules: z
+        .array(routingQualityRuleId)
+        .optional()
+        .describe("Rules that the route satisfied."),
+      ruleResults: z
+        .record(routingQualityRuleId, z.boolean())
+        .optional()
+        .describe("Rule pass/fail map. false means the rule was not satisfied and adds its score."),
+      autoDetect: z
+        .boolean()
+        .optional()
+        .describe("Automatically inspect board geometry for implemented rules (default true)."),
+      highSpeedNets: z
+        .array(z.string())
+        .optional()
+        .describe("Nets to treat as high-speed for board-edge and detour checks."),
+      criticalNets: z
+        .array(z.string())
+        .optional()
+        .describe("Nets to treat as critical for detour and board-edge checks."),
+      groundNets: z
+        .array(z.string())
+        .optional()
+        .describe("Ground net names used when checking nearby return-path vias."),
+      crystalNets: z
+        .array(z.string())
+        .optional()
+        .describe("Nets to treat as crystal/oscillator nets for crystal_short_no_via."),
+      differentialPairs: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe("Explicit differential-pair mate map, e.g. { USB_D_P: 'USB_D_N' }."),
+      connectorRefs: z
+        .array(z.string())
+        .optional()
+        .describe("Explicit connector footprint references for ESD proximity checking."),
+      esdRefs: z
+        .array(z.string())
+        .optional()
+        .describe("Explicit ESD/TVS footprint references for ESD proximity checking."),
+      boardEdgeClearanceMm: z
+        .number()
+        .optional()
+        .describe("Minimum high-speed route clearance to board edge in mm (default 3.0)."),
+      returnViaRadiusMm: z
+        .number()
+        .optional()
+        .describe("Required GND return via radius around signal layer-transition vias in mm (default 2.0)."),
+      maxDetourRatio: z
+        .number()
+        .optional()
+        .describe("Maximum route length / straight-line span for critical nets (default 1.5)."),
+      maxDetourExtraMm: z
+        .number()
+        .optional()
+        .describe("Minimum extra length before detour is considered excessive in mm (default 5.0)."),
+      maxDiffPairSeparationMm: z
+        .number()
+        .optional()
+        .describe("Maximum allowed same-layer separation from the mate differential trace in mm (default 0.5)."),
+      maxCrystalTraceLengthMm: z
+        .number()
+        .optional()
+        .describe("Maximum crystal/oscillator route length in mm (default 10.0)."),
+      maxEsdConnectorDistanceMm: z
+        .number()
+        .optional()
+        .describe("Maximum distance between connector pad and ESD/TVS pad on the protected net in mm (default 5.0)."),
+      routes: z
+        .array(routingQualityRouteInput)
+        .optional()
+        .describe("Batch input for evaluating multiple routes. Top-level dynamicRules are inherited."),
+      includeRuleCatalog: z
+        .boolean()
+        .optional()
+        .describe("Include the full built-in rule catalog in the response."),
+    },
+    async (args: any) => {
+      const result = await callKicadScript("evaluate_routing_quality", args);
       return {
         content: [
           {
