@@ -2,6 +2,17 @@
 
 https://github.com/mixelpixx/KiCAD-MCP-Server/discussions/73
 
+> ## 🚀 Meet Konnect — the next generation
+>
+> **[Konnect](https://github.com/mixelpixx/Konnect)** is this project rebuilt from
+> scratch in Rust as a native KiCAD 10 plugin: a single binary with no runtime
+> dependencies, built on KiCAD's official IPC API instead of SWIG, with 171 tools,
+> bundled Claude skills and agents, design-review audits, and a manufacturing
+> pipeline. It's where new development happens — licensed AGPL-3.0 (free for
+> individuals and open source; commercial licenses available for businesses).
+>
+> This Python/TypeScript server remains fully open (MIT) and maintained.
+
 # KiCAD MCP Server
 
 A Model Context Protocol (MCP) server that enables AI assistants like Claude to interact with KiCAD for PCB design automation. Built on the MCP 2025-06-18 specification, this server provides comprehensive tool schemas and real-time project state access for intelligent PCB design workflows.
@@ -12,7 +23,7 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 
 **Key Capabilities:**
 
-- 122 tools across 16 categories with JSON Schema validation
+- 124 tools across 13 categories with JSON Schema validation
 - Smart tool discovery with router pattern (reduces AI context by 70%)
 - 8 dynamic resources exposing project state
 - Complete schematic workflow with 27 tools and dynamic symbol loading (~10,000 symbols)
@@ -28,6 +39,77 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 ## Try out Arduino MCP - now you can get Claude to help in the IDE, real time!:
 
 https://github.com/mixelpixx/arduino-ide
+
+## What's New in v2.4.0
+
+### Symbol library management
+
+- `import_symbol` / `export_symbol` / `rename_symbol` copy a symbol between
+  `.kicad_sym` libraries, extract one to a standalone file, and rename a
+  symbol including its sub-symbol shards and any `(extends ...)` references
+  from derived symbols in the same library.
+- `add_symbol_property` and `add_library_symbol_property` set custom BOM
+  fields (Manufacturer, MPN, LCSC, ...) on a library symbol or on a
+  schematic's cached definition.
+- `update_symbol_from_library` refreshes cached `lib_symbols` definitions
+  across one schematic, a list, or every project under a directory —
+  the programmatic equivalent of KiCad's Update Symbol from Library.
+- `replace_instance_lib_ids` swaps `lib_id` references per an explicit
+  old-to-new mapping, for migrating a schematic between libraries.
+
+### Faster symbol discovery
+
+- Library directories, resolved paths, extracted symbol blocks, and parsed
+  symbol lists are now cached process-wide instead of being rebuilt for every
+  component add. Staleness guards revalidate paths and track source `mtime_ns`,
+  and the mutating write paths clear the caches explicitly.
+
+### Fixes that restore basic operation
+
+- Every `.kicad_sym` and schematic write raised `TypeError` on Python 3.9, the
+  project's declared floor — `Path.write_text` did not accept `newline` until
+  3.10.
+- JLCPCB part search could not find hyphenated MPNs.
+- Eagle import wrote a KiCad 9 schematic header; it now writes the KiCad 10
+  header, verified against real `kicad-cli` 10.0.
+- Component placement snaps to the 1.27 mm grid, `import_ses` no longer
+  creates phantom slashless nets, and `export_dsn`/`autoroute` keep
+  `.kicad_pro` net classes.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.3.1
+
+### Eagle schematic import
+
+- `import_eagle_schematic` converts Eagle `.sch` XML designs to KiCad format
+  with symbol mapping, net wires, multi-gate parts, dangling-wire pruning,
+  and ground-truth ERC reporting via `kicad-cli`.
+
+### 3D model tools and interactive reload
+
+- `add_component_3d_model` / `remove_component_3d_model` for attaching
+  STEP/WRL models to footprints.
+- Opt-in `KICAD_INTERACTIVE_SCHEMATIC=1` auto-confirms KiCad's reload dialog
+  on Windows after schematic writes.
+
+### Scaffolding cluster complete
+
+- New projects start blank (no `_TEMPLATE_*` symbols leaked into user files).
+- `.kicad_pro` files match what KiCad itself writes.
+- Format version `20260101` ensures all KiCad 10.0.x builds can open
+  generated schematics.
+
+### KiCad 10 compatibility
+
+- Derived symbols in `.kicad_symdir` libraries resolve their parent from
+  sibling shards.
+- Unified install discovery finds relocated Windows installs via registry.
+- User env-var placeholders from `kicad_common.json` are resolved in library
+  paths.
+- Phantom cross-unit pin reports in `get_wire_connections` are eliminated.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
 
 ## What's New in v2.3.0
 
@@ -227,9 +309,8 @@ configuration command and backend options.
 
 We've implemented an intelligent tool router to keep AI context efficient while maintaining full functionality:
 
-- **18 direct tools** always visible for high-frequency operations
-- **65 routed tools** organized into 8 categories (board, component, export, drc, schematic, library, routing, autoroute)
-- **35 additional tools** always visible (symbol/footprint creators, JLCPCB, datasheet, advanced routing)
+- **22 direct tools** always visible for high-frequency operations
+- **102 routed tools** organized into 13 categories (board, component, export, drc, schematic, library, symbol_pins, schematic_hierarchy, schematic_layout, schematic_batch, routing, autoroute, parts-registry)
 - **4 router tools** for discovery and execution:
   - `list_tool_categories` - Browse all available categories
   - `get_category_tools` - View tools in a specific category
@@ -298,7 +379,7 @@ Access project state without executing tools:
 
 ## Available Tools
 
-The server provides **122 tools** organized into 16 functional categories. With the router pattern, tools are automatically discovered as needed -- just ask Claude what you want to accomplish.
+The server provides **124 tools** organized into 13 functional categories. With the router pattern, tools are automatically discovered as needed -- just ask Claude what you want to accomplish.
 
 For the complete tool reference with access types (direct/routed/additional), see [Tool Inventory](docs/TOOL_INVENTORY.md).
 
@@ -406,7 +487,7 @@ See [Schematic Tools Reference](docs/SCHEMATIC_TOOLS_REFERENCE.md) for details a
 - `set_design_rules` / `get_design_rules` - Configure and inspect rules
 - `run_drc` - Execute design rule check
 - `get_drc_violations` - Get violation list by severity
-- `add_net_class` / `assign_net_to_class` - Net class management
+- `create_netclass` / `assign_net_to_class` - Net class management
 - `set_layer_constraints` / `check_clearance` - Layer and clearance rules
 
 ### Export (8 tools)
@@ -1175,7 +1256,7 @@ How many Basic parts are available?
 - **JSON-RPC 2.0 Transport:** Bi-directional communication via STDIO
 - **Protocol Version:** MCP 2025-06-18
 - **Capabilities:** Tools (122), Resources (8)
-- **Tool Router:** Intelligent discovery system with 8 categories
+- **Tool Router:** Intelligent discovery system with 13 categories
 - **Error Handling:** Standard JSON-RPC error codes
 
 ### TypeScript Server (`src/`)
@@ -1318,11 +1399,11 @@ npm run format
 
 ## Project Status
 
-**Current Version:** 2.3.0
+**Current Version:** 2.4.0
 
 See [STATUS_SUMMARY.md](docs/STATUS_SUMMARY.md) for the complete status matrix and [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 
-**Working Features (122 tools):**
+**Working Features (124 tools):**
 
 - Project management with snapshot checkpointing
 - Complete board design (outline, layers, zones, mounting holes, text, SVG logos)
@@ -1353,12 +1434,12 @@ Set `KICAD_MCP_DEV=1` to capture MCP session logs for debugging. See CHANGELOG v
 **Logging (`~/.kicad-mcp/logs/`):**
 Logs default to `INFO` and the file is size-capped so it can't grow without bound. Tune via the MCP server's environment:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `LOG_LEVEL` / `KICAD_MCP_LOG_LEVEL` | `info` | Log verbosity (`error`/`warn`/`info`/`debug`, or `off`). `KICAD_MCP_LOG_LEVEL` wins. |
-| `KICAD_MCP_LOG_MAX_BYTES` | `10485760` (10 MB) | Max size per log file before it rotates; `0` disables rotation. |
-| `KICAD_MCP_LOG_BACKUP_COUNT` | `3` | Number of rotated backups to keep. |
-| `KICAD_MCP_DEBUG_SKIP` | unset | Set to `1` to re-enable the verbose kicad-skip parser DEBUG logs (muted by default). |
+| Variable                            | Default            | Purpose                                                                              |
+| ----------------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
+| `LOG_LEVEL` / `KICAD_MCP_LOG_LEVEL` | `info`             | Log verbosity (`error`/`warn`/`info`/`debug`, or `off`). `KICAD_MCP_LOG_LEVEL` wins. |
+| `KICAD_MCP_LOG_MAX_BYTES`           | `10485760` (10 MB) | Max size per log file before it rotates; `0` disables rotation.                      |
+| `KICAD_MCP_LOG_BACKUP_COUNT`        | `3`                | Number of rotated backups to keep.                                                   |
+| `KICAD_MCP_DEBUG_SKIP`              | unset              | Set to `1` to re-enable the verbose kicad-skip parser DEBUG logs (muted by default). |
 
 See [ROADMAP.md](docs/ROADMAP.md) for planned features.
 

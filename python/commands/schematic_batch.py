@@ -385,17 +385,29 @@ class SchematicBatchCommands:
                 )
 
             if fields_to_restore:
-                content_after = sch_file.read_text(encoding="utf-8")
-                new_block, _, _ = _find_placed_symbol_block(content_after, reference)
-                if new_block:
-                    for fname, fval in fields_to_restore.items():
-                        prop_pat = re.compile(
-                            r'(\(property\s+"' + re.escape(fname) + r'"\s+)"[^"]*"'
-                        )
-                        content_after = prop_pat.sub(
-                            r'\1"' + fval.replace('"', '\\"') + '"', content_after, count=1
-                        )
-                    sch_file.write_text(content_after, encoding="utf-8")
+                # Restore the remaining fields through the block-scoped component
+                # editor. A plain regex substitution over the whole file (the
+                # previous implementation) replaced the FIRST matching
+                # (property "<name>" ...) in the file, which for common field
+                # names like "Description" lives inside lib_symbols — corrupting
+                # an unrelated library symbol definition instead of this
+                # component instance.
+                restore_result = self.iface._handle_edit_schematic_component(
+                    {
+                        "schematicPath": schematic_path,
+                        "reference": reference,
+                        "properties": {
+                            fname: {"value": fval} for fname, fval in fields_to_restore.items()
+                        },
+                    }
+                )
+                if not restore_result.get("success"):
+                    logger.warning(
+                        "Could not restore fields %s on %s after replace: %s",
+                        sorted(fields_to_restore),
+                        reference,
+                        restore_result.get("message"),
+                    )
 
             pin_locator = PinLocator()
             pins_raw = pin_locator.get_all_symbol_pins(sch_file, reference) or {}
@@ -808,6 +820,19 @@ class SchematicBatchCommands:
 
         except Exception as e:
             logger.error(f"Error in batch_add_and_connect: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def update_symbol_from_library(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Refresh lib_symbols cache entries from the symbol library."""
+        from commands.update_symbol_from_library import update_symbol_from_library
+
+        try:
+            return update_symbol_from_library(params)
+        except Exception as e:
+            logger.error(f"Error in update_symbol_from_library: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
